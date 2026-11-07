@@ -16,7 +16,7 @@
     "start": "node lib/index.js",
     "lint": "eslint .",
     "fixlint": "eslint . --fix",
-    "test": "c8 playwright test",
+    "test": "npm run build -- --inlineSourceMap --inlineSources && c8 playwright test",
     "watch": "tsc --watch",
     "clean": "rm -rf lib",
     "prepare": "husky"

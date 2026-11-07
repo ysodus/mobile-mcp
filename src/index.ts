@@ -7,11 +7,54 @@ import { createMcpServer, getAgentVersion, getSdkVersion } from "./server";
 import { error } from "./logger";
 import { Request, Response } from "express";
 import { program } from "commander";
+import { createServer, IncomingMessage } from "node:http";
+import { isIP } from "node:net";
 
 type InstallOptions = { yes?: boolean };
 
 const logMcpError = (err: Error) => {
 	error("Error handling MCP request: " + (err.stack ?? String(err)));
+};
+
+const dnsLabel = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i;
+
+const parsePort = (value: string) => {
+	const port = Number(value);
+	return /^[0-9]+$/.test(value) && port >= 1 && port <= 65535 ? port : undefined;
+};
+
+const isHttpAuthority = (value: string) => {
+	const match = /^(\[[0-9a-f:.]+\]|[a-z0-9.-]+)(?::([0-9]+))?$/i.exec(value);
+	if (!match || (match[2] !== undefined && parsePort(match[2]) === undefined)) {
+		return false;
+	}
+	const hostname = match[1];
+	if (hostname.startsWith("[")) {
+		return isIP(hostname.slice(1, -1)) === 6;
+	}
+	if (isIP(hostname) === 4) {
+		return true;
+	}
+
+	// WHATWG URLs interpret a final numeric label as IPv4. Accept only canonical IPv4 above.
+	const labels = hostname.split(".");
+	const numericLabel = /^(?:[0-9]+|0x[0-9a-f]*)$/i;
+	return hostname.length <= 253 && labels.every(label => dnsLabel.test(label)) &&
+		!numericLabel.test(labels[labels.length - 1]);
+};
+
+const invalidHttpHeader = (req: IncomingMessage) => {
+	// Unlike req.headers, headersDistinct retains duplicate field lines.
+	const { host, origin } = req.headersDistinct;
+	if (host?.length !== 1 || !isHttpAuthority(host[0])) {
+		return "Invalid Host header";
+	}
+	if (origin !== undefined) {
+		const match = origin.length === 1 && /^https?:\/\/(.+)$/i.exec(origin[0]);
+		if (!match || !isHttpAuthority(match[1])) {
+			return "Invalid Origin header";
+		}
+	}
 };
 
 const startHttpServer = async (host: string, port: number) => {
@@ -23,7 +66,6 @@ const startHttpServer = async (host: string, port: number) => {
 		app = createMcpExpressApp({ host });
 	} else {
 		const hostnames = configuredHosts.split(",").map(value => value.trim());
-		const dnsLabel = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i;
 		for (const hostname of hostnames) {
 			const labels = hostname.split(".");
 			if (hostname.length > 253 || labels.length < 2 ||
@@ -36,8 +78,8 @@ const startHttpServer = async (host: string, port: number) => {
 			error("MOBILEMCP_ALLOWED_HOSTS requires a loopback --listen address.");
 			process.exit(1);
 		}
-		if (!authToken) {
-			error("MOBILEMCP_ALLOWED_HOSTS requires MOBILEMCP_AUTH.");
+		if (!authToken || !/^[A-Za-z0-9._~+\/-]+=*$/.test(authToken)) {
+			error("MOBILEMCP_ALLOWED_HOSTS requires MOBILEMCP_AUTH in Bearer token format.");
 			process.exit(1);
 		}
 
@@ -48,7 +90,7 @@ const startHttpServer = async (host: string, port: number) => {
 		app.use((req, res, next) => {
 			const origin = req.headers.origin;
 			// The SDK checks hostnames. Restrict newly allowed browser origins to HTTPS on port 443.
-			if (origin === undefined || (origin && validateOriginHeader(origin, loopbackHosts).ok) || privateOrigins.has(origin)) {
+			if (origin === undefined || privateOrigins.has(origin) || validateOriginHeader(origin, loopbackHosts).ok) {
 				next();
 				return;
 			}
@@ -114,8 +156,24 @@ const startHttpServer = async (host: string, port: number) => {
 	app.get("/mcp", methodNotAllowed);
 	app.delete("/mcp", methodNotAllowed);
 
-	app.listen(port, host, () => {
-		error(`mobile-mcp ${getAgentVersion()} streamable http server listening on http://${host}:${port}/mcp`);
+	const server = createServer((req, res) => {
+		const invalidHeader = invalidHttpHeader(req);
+		if (invalidHeader) {
+			res.writeHead(400, { "Content-Type": "application/json" }).end(JSON.stringify({ error: invalidHeader }));
+			return;
+		}
+		app(req, res);
+	});
+
+	// In whitelist mode use a numeric bind address even when --listen defaults to localhost.
+	const bindHost = configuredHosts !== undefined && host === "localhost" ? "127.0.0.1" : host;
+	const displayHost = isIP(bindHost) === 6 ? `[${bindHost}]` : bindHost;
+	server.once("error", (err: NodeJS.ErrnoException) => {
+		error(`Mobile MCP HTTP listen failed (${err.code ?? "unknown error"}).`);
+		process.exitCode = 1;
+	});
+	server.listen(port, bindHost, () => {
+		error(`mobile-mcp ${getAgentVersion()} streamable http server listening on http://${displayHost}:${port}/mcp`);
 	});
 };
 
@@ -190,8 +248,8 @@ const installIntoDetectedClients = async (options: InstallOptions) => {
 const startServer = async () => {
 	const options = program.opts();
 
-	if (options.listen) {
-		const listen = (options.listen as string).trim();
+	if (options.listen !== undefined) {
+		const listen = options.listen as string;
 		const lastColon = listen.lastIndexOf(":");
 		let host = "localhost";
 		let rawPort: string;
@@ -203,8 +261,11 @@ const startServer = async () => {
 			rawPort = listen;
 		}
 
-		const port = Number.parseInt(rawPort, 10);
-		if (!host || !rawPort || !Number.isInteger(port) || port < 1 || port > 65535) {
+		if (host === "[::1]") {
+			host = "::1";
+		}
+		const port = parsePort(rawPort);
+		if (port === undefined) {
 			error(`Invalid --listen value "${listen}". Expected [host:]port with port 1-65535.`);
 			process.exit(1);
 		}

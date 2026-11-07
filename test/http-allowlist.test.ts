@@ -1,14 +1,13 @@
 import { expect, test } from "@playwright/test";
-import { spawn, execFileSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { request } from "node:http";
-import { createServer } from "node:net";
-import { copyFileSync, mkdtempSync, rmSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { createConnection, createServer } from "node:net";
+import { resolve } from "node:path";
 
 const privateHost = "ss-macbook-air.tailf25270.ts.net";
-const token = randomUUID();
+const token = randomUUID() + "._~+/=";
 const initialize = {
 	jsonrpc: "2.0",
 	id: 1,
@@ -19,65 +18,78 @@ const initialize = {
 		clientInfo: { name: "allowlist-test", version: "1.0.0" },
 	},
 };
-let stageDir: string;
-
-test.beforeAll(() => {
-	stageDir = mkdtempSync(resolve("test-results", "allowlist-"));
-	copyFileSync("package.json", join(stageDir, "package.json"));
-	execFileSync(process.execPath, [require.resolve("typescript/bin/tsc"), "--outDir", join(stageDir, "lib")]);
-});
-
-test.afterAll(() => {
-	if (stageDir) {
-		rmSync(stageDir, { recursive: true, force: true });
-	}
-});
-
-const start = (args: string[], hosts?: string, authenticate = true) => {
+const start = (args: string[], hosts?: string, auth: string | null = token) => {
 	const env: NodeJS.ProcessEnv = { ...process.env, MOBILEMCP_DISABLE_TELEMETRY: "1" };
 	delete env.MOBILEMCP_ALLOWED_HOSTS;
 	delete env.MOBILEMCP_AUTH;
 	if (hosts !== undefined) {
 		env.MOBILEMCP_ALLOWED_HOSTS = hosts;
 	}
-	if (authenticate) {
-		env.MOBILEMCP_AUTH = token;
+	if (auth !== null) {
+		env.MOBILEMCP_AUTH = auth;
 	}
-	const child = spawn(process.execPath, [join(stageDir, "lib", "index.js"), ...args], { env });
+	// Exit through Node so V8 writes coverage even when the test stops the HTTP server.
+	const shutdown = 'process.once("SIGTERM", () => process.exit(0)); require(process.argv[1]);';
+	const child = spawn(process.execPath, ["-e", shutdown, "--", resolve("lib/index.js"), ...args], { env });
+	let exited = false;
+	const closed = once(child, "close").then(result => {
+		exited = true;
+		return result;
+	});
 	let stderr = "";
 	let stdout = "";
 	child.stderr.setEncoding("utf8").on("data", chunk => { stderr += chunk; });
 	child.stdout.setEncoding("utf8").on("data", chunk => { stdout += chunk; });
-	return { child, closed: once(child, "close"), stderr: () => stderr, stdout: () => stdout };
+	return { child, closed, exited: () => exited, stderr: () => stderr, stdout: () => stdout };
 };
 
-const isolatedPort = async () => {
-	const socket = createServer().listen(0, "127.0.0.1");
+const isolatedPort = async (address = "127.0.0.1") => {
+	const socket = createServer().listen(0, address);
 	await once(socket, "listening");
-	const address = socket.address();
-	if (!address || typeof address === "string") {
+	const bound = socket.address();
+	if (!bound || typeof bound === "string") {
 		throw new Error("No test TCP address");
 	}
 	await new Promise<void>((resolve, reject) => socket.close(err => err ? reject(err) : resolve()));
-	return address.port;
+	return bound.port;
 };
 
-const withHttpServer = async (hosts: string | undefined, run: (port: number) => Promise<void>) => {
-	const port = await isolatedPort();
-	const server = start(["--listen", `127.0.0.1:${port}`], hosts);
-	try {
-		await expect.poll(server.stderr).toContain(`listening on http://127.0.0.1:${port}/mcp`);
-		await run(port);
-	} finally {
-		server.child.kill();
-		await server.closed;
+const withHttpServer = async (
+	hosts: string | undefined,
+	run: (port: number) => Promise<void>,
+	address = "127.0.0.1",
+) => {
+	for (let attempt = 0; attempt < 3; attempt++) {
+		const port = await isolatedPort(address);
+		const host = address === "::1" ? "[::1]" : address;
+		const server = start(["--listen", `${host}:${port}`], hosts);
+		const ready = `listening on http://${host}:${port}/mcp`;
+		try {
+			await expect.poll(() => server.stderr().includes(ready) || server.exited()).toBe(true);
+			if (server.stderr().includes("listen failed (EADDRINUSE)")) {
+				continue;
+			}
+			expect(server.stderr()).toContain(ready);
+			await run(port);
+			return;
+		} finally {
+			server.child.kill();
+			await server.closed;
+		}
 	}
+	throw new Error("Could not bind a test port after three attempts");
 };
 
-const post = (port: number, host: string, headers: Record<string, string | undefined> = {}) =>
+const post = (
+	port: number,
+	host: string,
+	headers: Record<string, string | undefined> = {},
+	body: object = initialize,
+	address = "127.0.0.1",
+) =>
 	new Promise<{ status: number | undefined; body: string }>((resolve, reject) => {
 		const req = request({
-			hostname: "127.0.0.1",
+			hostname: address,
 			port,
 			path: "/mcp",
 			method: "POST",
@@ -96,12 +108,16 @@ const post = (port: number, host: string, headers: Record<string, string | undef
 		});
 		req.setTimeout(5000, () => req.destroy(new Error("MCP request timed out")));
 		req.on("error", reject);
-		req.end(JSON.stringify(initialize));
+		req.end(JSON.stringify(body));
 	});
 
-const expectInitialize = (body: string) => {
+const parseResponse = (body: string) => {
 	const data = body.split("\n").find(line => line.startsWith("data: "));
-	expect(JSON.parse(data ? data.slice(6) : body)).toMatchObject({
+	return JSON.parse(data ? data.slice(6) : body);
+};
+
+const expectInitialize = (body: string) => {
+	expect(parseResponse(body)).toMatchObject({
 		jsonrpc: "2.0",
 		id: 1,
 		result: {
@@ -112,11 +128,32 @@ const expectInitialize = (body: string) => {
 	});
 };
 
+const expectToolsList = async (port: number, host: string, address?: string) => {
+	const response = await post(port, host, { "mcp-protocol-version": "2025-11-25" }, {
+		jsonrpc: "2.0",
+		id: 2,
+		method: "tools/list",
+		params: {},
+	}, address);
+	expect(response.status).toBe(200);
+	expect(parseResponse(response.body)).toMatchObject({
+		jsonrpc: "2.0",
+		id: 2,
+		result: {
+			tools: expect.arrayContaining([expect.objectContaining({ name: "mobile_list_available_devices" })]),
+		},
+	});
+};
+
 test("keeps the default loopback Host and Origin policy", async () => {
 	await withHttpServer(undefined, async port => {
 		const response = await post(port, `127.0.0.1:${port}`, { origin: `http://127.0.0.1:${port}` });
 		expect(response.status).toBe(200);
 		expectInitialize(response.body);
+		await expectToolsList(port, "localhost");
+		const auth = `Authorization: Bearer ${token}`;
+		expect(await rawRequest(port, ["Host: localhost", "Host: localhost", auth])).toBe(400);
+		expect(await rawRequest(port, ["Host: localhost", "Origin: https://localhost/path", auth])).toBe(400);
 		expect((await post(port, privateHost)).status).toBe(403);
 		expect((await post(port, "localhost", { origin: "https://evil.example" })).status).toBe(403);
 		expect((await post(port, "localhost", { authorization: undefined })).status).toBe(401);
@@ -129,17 +166,19 @@ test("adds only exact trusted Hosts and HTTPS Origins while still requiring auth
 			[privateHost],
 			[`${privateHost.toUpperCase()}:443`, `https://${privateHost}`],
 			["second.example"],
-			["localhost"],
+			["localhost", "http://localhost:65535"],
+			["127.0.0.1:1", "https://127.0.0.1"],
 		];
 		for (const [host, origin] of allowed) {
 			const response = await post(port, host, { origin });
 			expect(response.status).toBe(200);
 			expectInitialize(response.body);
 		}
+		await expectToolsList(port, privateHost);
 		for (const host of ["evil.example", `prefix.${privateHost}`, `${privateHost}.evil.example`]) {
 			expect((await post(port, host)).status).toBe(403);
 		}
-		for (const origin of ["https://evil.example", `https://${privateHost}.evil.example`, `http://${privateHost}`, `https://${privateHost}:444`, "null", ""]) {
+		for (const origin of ["https://evil.example", `https://${privateHost}.evil.example`, `http://${privateHost}`, `https://${privateHost}:444`]) {
 			expect((await post(port, privateHost, { origin })).status).toBe(403);
 		}
 		for (const authorization of [undefined, "Bearer wrong"]) {
@@ -155,6 +194,21 @@ test("adds only exact trusted Hosts and HTTPS Origins while still requiring auth
 		expect((await post(port, privateHost, { ...forwarded, authorization: undefined })).status).toBe(401);
 	});
 });
+
+const expectStartupError = async (listen: string, auth: string | null, message: string) => {
+	const server = start(["--listen", listen], privateHost, auth);
+	try {
+		await expect.poll(server.stderr).toContain(message);
+		expect(await server.closed).toEqual([1, null]);
+		expect(server.stderr()).not.toContain("listening on");
+		if (auth && auth.trim() && auth !== token) {
+			expect(server.stderr()).not.toContain(auth);
+		}
+	} finally {
+		server.child.kill();
+		await server.closed;
+	}
+};
 
 test("rejects invalid HTTP configuration before listening", async () => {
 	const port = await isolatedPort();
@@ -174,23 +228,20 @@ test("rejects invalid HTTP configuration before listening", async () => {
 			await server.closed;
 		}
 	}
-	for (const [address, authenticate, message] of [
-		[`0.0.0.0:${port}`, true, "requires a loopback"],
-		[listen, false, "requires MOBILEMCP_AUTH"],
-	] as const) {
-		const server = start(["--listen", address], privateHost, authenticate);
-		try {
-			await expect.poll(server.stderr).toContain(message);
-			expect(await server.closed).toEqual([1, null]);
-		} finally {
-			server.child.kill();
-			await server.closed;
-		}
+	const invalidListen = ["", "0", "65536", "123abc", "+123", "1.5", " 123", "123 ", "127.0.0.1:", ":123"];
+	for (const address of invalidListen) {
+		await expectStartupError(address, token, "Invalid --listen value");
+	}
+	for (const address of [`0.0.0.0:${port}`, `:::${port}`, `127.1:${port}`]) {
+		await expectStartupError(address, token, "requires a loopback");
+	}
+	for (const auth of [null, "", " ", "bad token", "bad\ttoken", "bad\ntoken", "bad:token", "bad=token", "=only"]) {
+		await expectStartupError(listen, auth, "requires MOBILEMCP_AUTH in Bearer token format");
 	}
 });
 
 test("stdio initialize ignores HTTP-only configuration", async () => {
-	const server = start(["--stdio"], "*", false);
+	const server = start(["--stdio"], "*", null);
 	try {
 		server.child.stdin.write(JSON.stringify(initialize) + "\n");
 		await expect.poll(server.stdout).toContain("\n");
@@ -198,5 +249,111 @@ test("stdio initialize ignores HTTP-only configuration", async () => {
 	} finally {
 		server.child.kill();
 		await server.closed;
+	}
+});
+
+const rawRequest = (port: number, headers: string[], method = "POST") =>
+	new Promise<number>((resolve, reject) => {
+		const body = method === "POST" ? JSON.stringify(initialize) : "";
+		const socket = createConnection(port, "127.0.0.1", () => {
+			socket.write([
+				`${method} /mcp HTTP/1.1`,
+				"Connection: close",
+				"Content-Type: application/json",
+				"Accept: application/json, text/event-stream",
+				`Content-Length: ${Buffer.byteLength(body)}`,
+				...headers,
+				"",
+				body,
+			].join("\r\n"));
+		});
+		let response = "";
+		socket.setEncoding("utf8").on("data", chunk => {
+			response += chunk;
+			const status = /^HTTP\/1\.1 (\d{3}) /.exec(response);
+			if (status) {
+				resolve(Number(status[1]));
+				socket.destroy();
+			}
+		});
+		socket.setTimeout(5000, () => socket.destroy(new Error("Raw MCP request timed out")));
+		socket.on("error", reject);
+		socket.on("end", () => reject(new Error("Missing HTTP status line")));
+	});
+
+test("rejects ambiguous or malformed raw Host fields before URL normalization", async () => {
+	await withHttpServer(privateHost, async port => {
+		const validHost = `Host: ${privateHost}`;
+		const invalidHeaders = [
+			[validHost, "Host: evil.example"],
+			["Host: evil.example", validHost],
+			[validHost, validHost],
+			...["/extra", ":", ":0", ":65536", "?q", "#fragment", "\\extra", ",evil.example"]
+				.map(suffix => [`Host: ${privateHost}${suffix}`]),
+			...[`%73${privateHost.slice(1)}`, `evil.example@${privateHost}`, "127.1", "0x7f000001", "0177.0.0.1", "::1"]
+				.map(host => [`Host: ${host}`]),
+		];
+		for (const headers of invalidHeaders) {
+			expect(await rawRequest(port, [...headers, `Authorization: Bearer ${token}`]), headers.join(" | ")).toBe(400);
+		}
+	});
+});
+
+test("rejects ambiguous or malformed raw Origin fields before URL normalization", async () => {
+	await withHttpServer(privateHost, async port => {
+		const validOrigin = "Origin: https://localhost";
+		const invalidHeaders = [
+			[validOrigin, validOrigin],
+			["Origin: https://localhost/path", "Origin: https://evil.example"],
+			["Origin: https://evil.example", validOrigin],
+			[`Origin: https://${privateHost}`, `Origin: https://${privateHost}`],
+			...["", "null", "https://localhost/path", "https://evil.example@localhost", "https://localhost?q",
+				"https://localhost#fragment", "https://localhost, https://evil.example", "https://localhost/",
+				"https://localhost:", "ftp://localhost", "https://127.1", "https://localhost\\path"]
+				.map(origin => [`Origin: ${origin}`]),
+		];
+		for (const headers of invalidHeaders) {
+			expect(await rawRequest(port, [`Host: ${privateHost}`, ...headers, `Authorization: Bearer ${token}`]), headers.join(" | ")).toBe(400);
+		}
+	});
+});
+
+test("accepts canonical IPv6 loopback Host and Origin over an IPv6 loopback listener", async () => {
+	await withHttpServer(privateHost, async port => {
+		const response = await post(port, `[::1]:${port}`, { origin: `http://[::1]:${port}` }, initialize, "::1");
+		expect(response.status).toBe(200);
+		expectInitialize(response.body);
+		await expectToolsList(port, privateHost, "::1");
+	}, "::1");
+});
+
+test("applies the same header and auth checks to every MCP HTTP method", async () => {
+	await withHttpServer(privateHost, async port => {
+		const host = `Host: ${privateHost}`;
+		const authorization = `Authorization: Bearer ${token}`;
+		for (const method of ["POST", "GET", "HEAD", "DELETE", "OPTIONS", "PUT", "PATCH"]) {
+			expect(await rawRequest(port, [host, host, authorization], method), method).toBe(400);
+			expect(await rawRequest(port, [host, "Origin: https://localhost/path", authorization], method), method).toBe(400);
+			expect(await rawRequest(port, ["Host: evil.example", `X-Forwarded-Host: ${privateHost}`, authorization], method), method).toBe(403);
+			expect(await rawRequest(port, [host, "Origin: https://evil.example", authorization], method), method).toBe(403);
+			expect(await rawRequest(port, [host], method), method).toBe(401);
+		}
+		for (const method of ["GET", "HEAD", "DELETE"]) {
+			expect(await rawRequest(port, [host, authorization], method), method).toBe(405);
+		}
+	});
+});
+
+test("reports a busy loopback port without advertising a listener", async () => {
+	const occupied = createServer().listen(0, "127.0.0.1");
+	try {
+		await once(occupied, "listening");
+		const address = occupied.address();
+		if (!address || typeof address === "string") {
+			throw new Error("No occupied test TCP address");
+		}
+		await expectStartupError(`127.0.0.1:${address.port}`, token, "listen failed (EADDRINUSE)");
+	} finally {
+		await new Promise<void>((resolve, reject) => occupied.close(err => err ? reject(err) : resolve()));
 	}
 });
