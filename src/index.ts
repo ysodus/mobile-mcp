@@ -170,7 +170,12 @@ const startHttpServer = async (host: string, port: number) => {
 
 	// Node dispatches CONNECT separately from ordinary HTTP requests.
 	server.on("connect", (_req, socket) => {
-		socket.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+		const destroy = () => socket.destroy();
+		// Bound the write even if the peer keeps its side open or the response cannot flush.
+		const deadline = setTimeout(destroy, 1000).unref();
+		socket.once("close", () => clearTimeout(deadline));
+		socket.once("error", destroy);
+		socket.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n", destroy);
 	});
 
 	// In whitelist mode use a numeric bind address even when --listen defaults to localhost.

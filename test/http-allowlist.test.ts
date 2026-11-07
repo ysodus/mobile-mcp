@@ -18,7 +18,9 @@ const initialize = {
 		clientInfo: { name: "allowlist-test", version: "1.0.0" },
 	},
 };
-const start = (args: string[], hosts?: string, auth: string | null = token) => {
+type SocketObservation = "close" | "stall";
+
+const start = (args: string[], hosts?: string, auth: string | null = token, observe?: SocketObservation) => {
 	const env: NodeJS.ProcessEnv = { ...process.env, MOBILEMCP_DISABLE_TELEMETRY: "1" };
 	delete env.MOBILEMCP_ALLOWED_HOSTS;
 	delete env.MOBILEMCP_AUTH;
@@ -29,8 +31,22 @@ const start = (args: string[], hosts?: string, auth: string | null = token) => {
 		env.MOBILEMCP_AUTH = auth;
 	}
 	// Exit through Node so V8 writes coverage even when the test stops the HTTP server.
-	const shutdown = 'process.once("SIGTERM", () => process.exit(0)); require(process.argv[1]);';
-	const child = spawn(process.execPath, ["-e", shutdown, "--", resolve("lib/index.js"), ...args], { env });
+	const setup = `
+		process.once("SIGTERM", () => process.exit(0));
+		${observe ? `
+			require("node:diagnostics_channel").subscribe("net.server.socket", ({ socket }) => {
+				socket.once("close", () => process.stderr.write("Test server socket closed\\n"));
+				if (${observe === "stall"}) {
+					socket.end = function () {
+						process.stderr.write("Test server socket write stalled\\n");
+						return this;
+					};
+				}
+			});
+		` : ""}
+		require(process.argv[1]);
+	`;
+	const child = spawn(process.execPath, ["-e", setup, "--", resolve("lib/index.js"), ...args], { env });
 	let exited = false;
 	const closed = once(child, "close").then(result => {
 		exited = true;
@@ -56,13 +72,14 @@ const isolatedPort = async (address = "127.0.0.1") => {
 
 const withHttpServer = async (
 	hosts: string | undefined,
-	run: (port: number) => Promise<void>,
+	run: (port: number, server: ReturnType<typeof start>) => Promise<void>,
 	address = "127.0.0.1",
+	observe?: SocketObservation,
 ) => {
 	for (let attempt = 0; attempt < 3; attempt++) {
 		const port = await isolatedPort(address);
 		const host = address === "::1" ? "[::1]" : address;
-		const server = start(["--listen", `${host}:${port}`], hosts);
+		const server = start(["--listen", `${host}:${port}`], hosts, token, observe);
 		const ready = `listening on http://${host}:${port}/mcp`;
 		try {
 			await expect.poll(() => server.stderr().includes(ready) || server.exited()).toBe(true);
@@ -70,7 +87,7 @@ const withHttpServer = async (
 				continue;
 			}
 			expect(server.stderr()).toContain(ready);
-			await run(port);
+			await run(port, server);
 			return;
 		} finally {
 			server.child.kill();
@@ -357,6 +374,59 @@ test("rejects other request-target forms with or without the private allowlist",
 			expect(await rawRequest(port, headers, "CONNECT", "localhost:443")).toBe(400);
 		});
 	}
+});
+
+const connectRequest = `CONNECT evil.example:443 HTTP/1.1\r\nHost: ${privateHost}\r\n\r\n`;
+
+test("releases rejected CONNECT sockets while unauthenticated clients keep writing enabled", async () => {
+	await withHttpServer(privateHost, async (port, server) => {
+		const clients = Array.from({ length: 4 }, () => createConnection({ host: "127.0.0.1", port, allowHalfOpen: true }));
+		try {
+			const responses = await Promise.all(clients.map(socket => new Promise<string>((resolve, reject) => {
+				let response = "";
+				socket.once("connect", () => socket.write(connectRequest));
+				socket.setTimeout(5000, () => socket.destroy(new Error("CONNECT response timed out")));
+				socket.on("error", reject);
+				socket.on("end", () => reject(new Error("CONNECT response ended before the HTTP headers")));
+				socket.setEncoding("utf8").on("data", chunk => {
+					response += chunk;
+					if (response.includes("\r\n\r\n")) {
+						socket.setTimeout(0);
+						resolve(response);
+					}
+				});
+			})));
+			for (const response of responses) {
+				expect(response).toMatch(/^HTTP\/1\.1 400 Bad Request\r\n/);
+			}
+			await expect.poll(() => server.stderr().match(/Test server socket closed/g)?.length ?? 0, { timeout: 2500 })
+				.toBe(clients.length);
+			expect(clients.every(socket => !socket.writableEnded && !socket.destroyed)).toBe(true);
+		} finally {
+			clients.forEach(socket => socket.destroy());
+		}
+	}, "127.0.0.1", "close");
+});
+
+test("bounds stalled CONNECT responses and survives a client reset", async () => {
+	await withHttpServer(privateHost, async (port, server) => {
+		const clients = Array.from({ length: 2 }, () => createConnection({ host: "127.0.0.1", port, allowHalfOpen: true }));
+		try {
+			await Promise.all(clients.map(async socket => {
+				await once(socket, "connect");
+				socket.on("error", () => {});
+				socket.write(connectRequest);
+			}));
+			await expect.poll(() => server.stderr().match(/Test server socket write stalled/g)?.length ?? 0).toBe(clients.length);
+			clients[0].resetAndDestroy();
+			await expect.poll(() => server.stderr().match(/Test server socket closed/g)?.length ?? 0, { timeout: 2500 })
+				.toBe(clients.length);
+			expect(clients[1].writableEnded).toBe(false);
+			expect(server.exited()).toBe(false);
+		} finally {
+			clients.forEach(socket => socket.destroy());
+		}
+	}, "127.0.0.1", "stall");
 });
 
 test("accepts canonical IPv6 loopback Host and Origin over an IPv6 loopback listener", async () => {
