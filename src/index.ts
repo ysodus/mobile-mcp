@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { createMcpExpressApp } from "@modelcontextprotocol/express";
 import { toNodeHandler } from "@modelcontextprotocol/node";
-import { createMcpHandler } from "@modelcontextprotocol/server";
+import { createMcpHandler, localhostAllowedHostnames, validateOriginHeader } from "@modelcontextprotocol/server";
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
 import { createMcpServer, getAgentVersion, getSdkVersion } from "./server";
 import { error } from "./logger";
@@ -15,9 +15,46 @@ const logMcpError = (err: Error) => {
 };
 
 const startHttpServer = async (host: string, port: number) => {
-	// createMcpExpressApp applies express.json() and Host-header DNS rebinding
-	// protection automatically when binding to localhost / 127.0.0.1 / ::1.
-	const app = createMcpExpressApp({ host });
+	const authToken = process.env.MOBILEMCP_AUTH;
+	const configuredHosts = process.env.MOBILEMCP_ALLOWED_HOSTS;
+	const loopbackHosts = localhostAllowedHostnames();
+	let app;
+	if (configuredHosts === undefined) {
+		app = createMcpExpressApp({ host });
+	} else {
+		const hostnames = configuredHosts.split(",").map(value => value.trim());
+		const dnsLabel = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i;
+		for (const hostname of hostnames) {
+			const labels = hostname.split(".");
+			if (hostname.length > 253 || labels.length < 2 ||
+				!labels.every(label => dnsLabel.test(label)) || !/^[a-z]/i.test(labels[labels.length - 1])) {
+				error("Invalid MOBILEMCP_ALLOWED_HOSTS. Expected comma-separated ASCII DNS hostnames without ports or wildcards.");
+				process.exit(1);
+			}
+		}
+		if (host !== "localhost" && host !== "127.0.0.1" && host !== "::1") {
+			error("MOBILEMCP_ALLOWED_HOSTS requires a loopback --listen address.");
+			process.exit(1);
+		}
+		if (!authToken) {
+			error("MOBILEMCP_ALLOWED_HOSTS requires MOBILEMCP_AUTH.");
+			process.exit(1);
+		}
+
+		const extraHosts = hostnames.map(hostname => hostname.toLowerCase());
+		const allowedHosts = [...new Set([...loopbackHosts, ...extraHosts])];
+		const privateOrigins = new Set(extraHosts.map(hostname => `https://${hostname}`));
+		app = createMcpExpressApp({ host, allowedHosts, allowedOrigins: allowedHosts });
+		app.use((req, res, next) => {
+			const origin = req.headers.origin;
+			// The SDK checks hostnames. Restrict newly allowed browser origins to HTTPS on port 443.
+			if (origin === undefined || (origin && validateOriginHeader(origin, loopbackHosts).ok) || privateOrigins.has(origin)) {
+				next();
+				return;
+			}
+			res.status(403).json({ error: "Invalid Origin" });
+		});
+	}
 
 	// Migration hint for clients still pointing at the removed SSE transport.
 	// Registered before auth so unauthenticated clients see the reason, not a 401.
@@ -32,7 +69,6 @@ const startHttpServer = async (host: string, port: number) => {
 		});
 	});
 
-	const authToken = process.env.MOBILEMCP_AUTH;
 	if (!authToken) {
 		error("WARNING: MOBILEMCP_AUTH is not set. The HTTP server will accept unauthenticated connections. Set MOBILEMCP_AUTH to require Bearer token authentication.");
 	}

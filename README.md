@@ -459,7 +459,7 @@ Then configure your MCP client to connect to `http://<host>:3000/mcp` (or `https
 
 > **Migration note:** `--listen` previously served the deprecated HTTP+SSE transport on `/mcp`. Clients must use Streamable HTTP against `http(s)://host:port/mcp`. The old pure-SSE flow on `/mcp` is no longer available.
 
-When binding to localhost, Host-header DNS rebinding protection is enabled automatically.
+When binding to localhost, the SDK automatically validates Host and Origin headers. For a private HTTPS reverse proxy that preserves the public-facing Host, see [trusted hosts and Mac deployment](docs/private-http-deployment.md).
 
 #### Authorization
 
