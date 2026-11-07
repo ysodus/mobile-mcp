@@ -10,6 +10,10 @@
 
 无论是否配置额外白名单，HTTP 服务都在 SDK 解析前检查原始请求字段。Host 必须恰好出现一次，使用合法的 DNS 主机名、标准点分十进制 IPv4 或括号 IPv6，可带范围为 `1–65535` 的端口。重复 Host 或 Origin、空端口、百分号编码以及其他畸形 authority 返回 HTTP `400`。SDK 仍对通过语法检查的 Host 进行精确主机名匹配，忽略大小写和请求 Host 中的端口。
 
+HTTP 后端只接受 origin-form 请求目标，例如 `/mcp` 或带查询的 `/mcp?client=example`。路径须以单个 `/` 开头，路径和查询可使用合法的百分号编码。absolute-form（如 `http://host/mcp`，即使其域名与 Host 一致）、`//host/path`、authority-form（`CONNECT host:port`）及 asterisk-form（`OPTIONS *`）均返回 `400`。畸形路径、反斜杠和片段也会被拒绝。后端在路由前检查请求目标，不改写它。
+
+这是仅提供 MCP 路由的源站端点。直连客户端和反向代理应向后端发送路径及可选查询。向后端发送代理式绝对 URL、尝试建立 CONNECT 隧道或探测服务器级 `OPTIONS *` 的客户端与该端点不兼容。
+
 Origin 校验浏览器请求的来源，与 Host 独立：
 
 - 无 Origin 的 MCP 客户端可以继续鉴权。存在 Origin 时，必须恰好有一个 HTTP 或 HTTPS 来源值。用户信息、路径（包括尾部斜杠）、查询、片段、逗号列表、空值和 `null` 均返回 `400`。

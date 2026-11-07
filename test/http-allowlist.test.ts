@@ -252,12 +252,12 @@ test("stdio initialize ignores HTTP-only configuration", async () => {
 	}
 });
 
-const rawRequest = (port: number, headers: string[], method = "POST") =>
+const rawRequest = (port: number, headers: string[], method = "POST", target = "/mcp") =>
 	new Promise<number>((resolve, reject) => {
 		const body = method === "POST" ? JSON.stringify(initialize) : "";
 		const socket = createConnection(port, "127.0.0.1", () => {
 			socket.write([
-				`${method} /mcp HTTP/1.1`,
+				`${method} ${target} HTTP/1.1`,
 				"Connection: close",
 				"Content-Type: application/json",
 				"Accept: application/json, text/event-stream",
@@ -316,6 +316,47 @@ test("rejects ambiguous or malformed raw Origin fields before URL normalization"
 			expect(await rawRequest(port, [`Host: ${privateHost}`, ...headers, `Authorization: Bearer ${token}`]), headers.join(" | ")).toBe(400);
 		}
 	});
+});
+
+test("accepts origin-form MCP requests and rejects absolute-form targets before routing", async () => {
+	await withHttpServer(privateHost, async port => {
+		const auth = `Authorization: Bearer ${token}`;
+		const headers = [`Host: ${privateHost}`, auth];
+		const response = await post(port, privateHost);
+		expect(response.status).toBe(200);
+		expectInitialize(response.body);
+		expect(await rawRequest(port, headers)).toBe(200);
+		expect(await rawRequest(port, headers, "POST", "/mcp?next=https%3A%2F%2Fevil.example?x=1")).toBe(200);
+		expect(await rawRequest(port, headers, "POST", "/%2Fevil.example/mcp")).toBe(404);
+		expect(await rawRequest(port, [headers[0]])).toBe(401);
+		expect(await rawRequest(port, ["Host: evil.example", auth])).toBe(403);
+
+		const targets = [
+			"http://evil.example/mcp", `https://${privateHost}/mcp`,
+			`http://evil.example@${privateHost}/mcp`, `http://${privateHost}@evil.example/mcp`,
+			`http://%73${privateHost.slice(1)}/mcp`, `http://${privateHost}%3A443/mcp`,
+			`http://${privateHost}:/mcp`, `http://${privateHost}:443/mcp`,
+			`http://${privateHost}:65536/mcp`, "http://[::1]:443/mcp",
+		];
+		for (const target of targets) {
+			expect(await rawRequest(port, headers, "POST", target), target).toBe(400);
+		}
+		expect(await rawRequest(port, ["Host: evil.example", auth], "POST", targets[1])).toBe(400);
+	});
+});
+
+test("rejects other request-target forms with or without the private allowlist", async () => {
+	for (const hosts of [undefined, privateHost]) {
+		await withHttpServer(hosts, async port => {
+			const headers = ["Host: localhost", `Authorization: Bearer ${token}`];
+			expect(await rawRequest(port, headers, "POST", "http://localhost/mcp")).toBe(400);
+			for (const target of ["//evil.example/mcp", "/\\evil.example/mcp", "/mcp#fragment", "/mcp?bad=%2", "mcp"]) {
+				expect(await rawRequest(port, headers, "POST", target), target).toBe(400);
+			}
+			expect(await rawRequest(port, headers, "OPTIONS", "*")).toBe(400);
+			expect(await rawRequest(port, headers, "CONNECT", "localhost:443")).toBe(400);
+		});
+	}
 });
 
 test("accepts canonical IPv6 loopback Host and Origin over an IPv6 loopback listener", async () => {

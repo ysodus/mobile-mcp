@@ -43,6 +43,9 @@ const isHttpAuthority = (value: string) => {
 		!numericLabel.test(labels[labels.length - 1]);
 };
 
+// The first "?" starts the optional query, which also permits additional "?" characters.
+const originFormTarget = /^\/(?!\/)(?:[a-z0-9!$&'()*+,.:;=?@_~\/-]|%[a-f0-9]{2})*$/i;
+
 const invalidHttpHeader = (req: IncomingMessage) => {
 	// Unlike req.headers, headersDistinct retains duplicate field lines.
 	const { host, origin } = req.headersDistinct;
@@ -157,12 +160,17 @@ const startHttpServer = async (host: string, port: number) => {
 	app.delete("/mcp", methodNotAllowed);
 
 	const server = createServer((req, res) => {
-		const invalidHeader = invalidHttpHeader(req);
-		if (invalidHeader) {
-			res.writeHead(400, { "Content-Type": "application/json" }).end(JSON.stringify({ error: invalidHeader }));
+		const invalidRequest = originFormTarget.test(req.url ?? "") ? invalidHttpHeader(req) : "Invalid request target";
+		if (invalidRequest) {
+			res.writeHead(400, { "Content-Type": "application/json" }).end(JSON.stringify({ error: invalidRequest }));
 			return;
 		}
 		app(req, res);
+	});
+
+	// Node dispatches CONNECT separately from ordinary HTTP requests.
+	server.on("connect", (_req, socket) => {
+		socket.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
 	});
 
 	// In whitelist mode use a numeric bind address even when --listen defaults to localhost.
